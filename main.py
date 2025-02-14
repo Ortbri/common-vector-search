@@ -1,66 +1,71 @@
-import numpy as np
-from PIL import Image, ExifTags
 import os
-from torchvision import transforms
-import torch
-from transformers import CLIPModel
-import upstash_vector as uv
+import torch # type: ignore
+import numpy as np # type: ignore
+from PIL import Image # type: ignore
+from torchvision import transforms # type: ignore
+from transformers import CLIPModel # type: ignore
+from supabase import create_client, Client # type: ignore
+from dotenv import load_dotenv # type: ignore
 
-upstash_url = os.environ.get('UPSTASH_URL')
-token = os.environ.get('UPSTASH_TOKEN')
-index = uv.Index(url=upstash_url, token=token)
+# Load environment variables
+load_dotenv()
 
-# Define your image directory
-image_dir = "./images/views"
+# Supabase credentials
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Missing Supabase credentials. Please check your .env file.")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Load CLIP model
+print("Loading CLIP model...")
 model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 
-# Define image preprocessing (ensure consistency with CLIP's training setup)
+# Define image preprocessing
 preprocess = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 ])
 
-def transform_image(image):
+def transform_image(image_path):
+    """Transform an image into a CLIP embedding."""
+    image = Image.open(image_path)
     image = preprocess(image)
-    image = image.unsqueeze(0)
+    image = image.unsqueeze(0)  # Add batch dimension
     with torch.no_grad():
         features = model.get_image_features(pixel_values=image)
     embedding = features.squeeze().cpu().numpy()
     return embedding.astype(np.float32)
 
-# Extract features for each image and insert into Upstash Vector index
-for filename in os.listdir(image_dir):
-    if filename.endswith(".jpg"):
-        image_path = os.path.join(image_dir, filename)
-        image = Image.open(image_path)
-        embedding = transform_image(image).tolist()
+def update_elements_with_embeddings():
+    """Retrieve elements from Supabase and update with vector embeddings."""
+    print("\nFetching elements from Supabase...")
+    response = supabase.table("elements").select("element_id, jpg_url").execute()
+    elements = response.data
 
-        id = filename
+    for element in elements:
+        element_id = element["element_id"]
+        image_url = element["jpg_url"]
 
-        index.upsert(vectors = [(id, embedding, {"metadata_field": "metadata_value"})])
+        if image_url:
+            try:
+                # Download and process image
+                image_path = "./temp.jpg"
+                os.system(f"curl -o {image_path} {image_url}")  # Download image
+                embedding = transform_image(image_path)
 
-        print(f"Upserted image {filename} with ID {filename}")
+                # Update Supabase with vector embedding
+                supabase.table("elements").update({
+                    "clip_embedding": embedding.tolist()
+                }).eq("element_id", element_id).execute()
 
+                print(f"✅ Updated {element_id}")
 
-# Query Upstash Vector index
+            except Exception as e:
+                print(f"❌ Error processing {element_id}: {str(e)}")
 
-# Define your query image
-query_image_path = "./query_image.jpg"
-
-# Preprocess query image
-query_image = Image.open(query_image_path)
-query_embedding = transform_image(query_image)
-
-# The top_k parameter controls the number of results to retrieve
-top_k = 5
-query_vector = query_embedding.tolist()
-result = index.query(vector=query_vector,  top_k=top_k, include_metadata=True)
-
-# Print results
-print(f"Query image: {query_image_path}")
-print(f"Top {top_k} results:")
-
-for i, res in enumerate(result):
-    print(f"Rank {i + 1}: ID={res.id}, score={res.score}")
-
+if __name__ == "__main__":
+    update_elements_with_embeddings()
